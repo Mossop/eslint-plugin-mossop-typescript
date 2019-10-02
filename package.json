@@ -1,0 +1,26 @@
+{
+  "name": "eslint-plugin-mossop-typescript",
+  "version": "0.5.0",
+  "description": "An eslint plugin that reports type checking errors from TypeScript.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Mossop/eslint-plugin-mossop-typescript.git"
+  },
+  "keywords": [
+    "typescript",
+    "eslint"
+  ],
+  "author": "Dave Townsend <dtownsend@oxymoronical.com>",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/Mossop/eslint-plugin-mossop-typescript/issues"
+  },
+  "homepage": "https://github.com/Mossop/eslint-plugin-mossop-typescript#readme",
+  "dependencies": {
+    "typescript": "^3.6.3"
+  }
+}
