@@ -20,7 +20,7 @@
     "url": "https://github.com/Mossop/eslint-plugin-mossop-typescript/issues"
   },
   "homepage": "https://github.com/Mossop/eslint-plugin-mossop-typescript#readme",
-  "dependencies": {
+  "peerDependencies": {
     "typescript": "^3.6.3"
   }
 }
