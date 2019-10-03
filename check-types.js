@@ -1,15 +1,23 @@
 const path = require("path");
 const fs = require("fs");
-const { getDefaultLibFileName, createLanguageService, getDefaultCompilerOptions } = require("typescript");
+const {
+  ScriptTarget, NewLineKind, ModuleKind, JsxEmit, ModuleResolutionKind, Extension,
+  getDefaultLibFileName, createLanguageService, getDefaultCompilerOptions } = require("typescript");
 
-const languageServerMap = new Map();
+const languageServiceMap = new Map();
 
-const SCRIPTS = [
-  ".js",
-  ".jsx",
+const TS_SCRIPTS = [
   ".ts",
   ".tsx",
+  ".d.ts",
 ];
+
+const JS_SCRIPTS = [
+  ".js",
+  ".jsx",
+];
+
+const SCRIPTS = TS_SCRIPTS.concat(JS_SCRIPTS);
 
 function findAllScripts(directory, scriptNames) {
   let entries = fs.readdirSync(directory, { withFileTypes: true });
@@ -75,16 +83,57 @@ class ScriptSnapshot {
   }
 }
 
-class LanguageServerHost {
+class LanguageServiceHost {
   constructor(projectRoot, compilerOptions) {
     this.projectRoot = projectRoot;
     this.compilerOptions = compilerOptions;
     this.snapshots = new Map();
     this._scripts = null;
+
+    // Can't get the correct paths for the actual root for some reason so do this dance.
+    let paths = require.resolve.paths(__filename);
+
+    let count = 0;
+    let dir = path.dirname(__filename);
+    while (true) {
+      count++;
+      let parent = path.dirname(dir);
+      if (parent == dir) {
+        break;
+      }
+      dir = parent;
+    }
+
+    // This gives us the global paths.
+    paths = paths.slice(count);
+
+    let parents = [];
+    dir = projectRoot;
+    while (true) {
+      parents.push(path.join(dir, "node_modules"));
+      let parent = path.dirname(dir);
+      if (parent == dir) {
+        break;
+      }
+      dir = parent;
+    }
+
+    while (parents.length) {
+      paths.unshift(parents.pop());
+    }
+
+    this.modulePaths = paths;
   }
 
   getCompilationSettings() {
     return this.compilerOptions;
+  }
+
+  getNewLine() {
+    if (NewLineKind[this.compilerOptions.newLine] == "CarriageReturnLineFeed") {
+      return "\r\n";
+    }
+    return "\n";
   }
 
   getScriptFileNames() {
@@ -116,6 +165,95 @@ class LanguageServerHost {
     let name = getDefaultLibFileName(options);
     let module = require.resolve("typescript");
     return path.join(path.dirname(module), name);
+  }
+
+  resolveModule(name, containingFile, paths) {
+    if (name.startsWith(".")) {
+      let target = path.resolve(path.dirname(containingFile), name);
+      try {
+        let stat = fs.statSync(target);
+        if (stat.isFile()) {
+          return {
+            resolvedModule: {
+              resolvedFileName: target,
+              isExternalLibraryImport: false,
+              extension: Extension[path.extname(target)],
+            }
+          };
+        } else if (stat.isDirectory()) {
+          target = path.join(target, "index");
+        }
+      } catch (e) {
+      }
+
+      for (let extension of SCRIPTS) {
+        try {
+          let check = `${target}${extension}`;
+          let stat = fs.statSync(check);
+          if (stat.isFile()) {
+            return {
+              resolvedModule: {
+                resolvedFileName: check,
+                isExternalLibraryImport: false,
+                extension: Extension[extension],
+              }
+            };
+          }
+        } catch (e) {
+        }
+      }
+
+      return undefined;
+    }
+
+    try {
+      let module = require.resolve(name, { paths });
+      if (path.extname(module) == "") {
+        return undefined;
+      }
+      return {
+        resolvedModule: {
+          resolvedFileName: module,
+          isExternalLibraryImport: module.indexOf(external) >= 0,
+          extension: Extension[path.extname(module)],
+        }
+      };
+    } catch (e) {
+    }
+    return undefined;
+  }
+
+  resolveModuleNames(moduleNames, containingFile, reusedNames, redirectedReference, options) {
+    let paths = [];
+    let dir = path.dirname(containingFile);
+    while (dir != this.projectRoot) {
+      paths.push(path.join(dir, "node_modules"));
+      dir = path.dirname(dir);
+    }
+
+    for (let dir of this.modulePaths) {
+      paths.push(dir);
+    }
+
+    return moduleNames.map((name) => {
+      let resolved = this.resolveModule(name, containingFile, paths);
+      return resolved ? resolved.resolvedModule : undefined;
+    })
+  }
+
+  getResolvedModuleWithFailedLookupLocationsFromCache(name, containingFile) {
+    let paths = [];
+    let dir = path.dirname(containingFile);
+    while (dir != this.projectRoot) {
+      paths.push(path.join(dir, "node_modules"));
+      dir = path.dirname(dir);
+    }
+
+    for (let dir of this.modulePaths) {
+      paths.push(dir);
+    }
+
+    return this.resolveModule(name, containingFile, paths);
   }
 }
 
@@ -160,7 +298,7 @@ function getLanguageService(context, node) {
     return null;
   }
 
-  let languageService = languageServerMap.get(configFile);
+  let languageService = languageServiceMap.get(configFile);
   if (languageService) {
     return languageService;
   }
@@ -180,69 +318,28 @@ function getLanguageService(context, node) {
   }
 
   if ("module" in compilerOptions) {
-    const ModuleKind = {
-      None: 0,
-      CommonJS: 1,
-      AMD: 2,
-      UMD: 3,
-      System: 4,
-      ES2015: 5,
-      ESNext: 99
-    };
-
     compilerOptions.module = translate(compilerOptions.module, ModuleKind);
   }
 
   if ("jsx" in compilerOptions) {
-    const JsxEmit = {
-      None: 0,
-      Preserve: 1,
-      React: 2,
-      ReactNative: 3,
-    };
-
     compilerOptions.jsx = translate(compilerOptions.jsx, JsxEmit);
   }
 
   if ("moduleResolution" in compilerOptions) {
-    const ModuleResolutionKind = {
-      Classic: 1,
-      NodeJs: 2
-    };
-
     compilerOptions.moduleResolution = translate(compilerOptions.moduleResolution, ModuleResolutionKind);
   }
 
   if ("newLine" in compilerOptions) {
-    const NewLineKind = {
-      CarriageReturnLineFeed: 0,
-      LineFeed: 1
-    };
-
     compilerOptions.newLine = translate(compilerOptions.newLine, NewLineKind);
   }
 
   if ("target" in compilerOptions) {
-    const ScriptTarget = {
-      ES3: 0,
-      ES5: 1,
-      ES2015: 2,
-      ES2016: 3,
-      ES2017: 4,
-      ES2018: 5,
-      ES2019: 6,
-      ES2020: 7,
-      ESNext: 99,
-      JSON: 100,
-      Latest: 99
-    };
-
     compilerOptions.target = translate(compilerOptions.target, ScriptTarget);
   }
 
-  let host = new LanguageServerHost(path.dirname(configFile), compilerOptions);
+  let host = new LanguageServiceHost(path.dirname(configFile), compilerOptions);
   languageService = createLanguageService(host);
-  languageServerMap.set(configFile, languageService);
+  languageServiceMap.set(configFile, languageService);
   return languageService;
 }
 
