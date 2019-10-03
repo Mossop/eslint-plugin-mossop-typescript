@@ -1,12 +1,14 @@
 import path from "path";
 import fs from "fs";
 import {
-  ScriptTarget, NewLineKind, ModuleKind, JsxEmit, ModuleResolutionKind, Extension,
-  LanguageService, LanguageServiceHost, Diagnostic, IScriptSnapshot, TextChangeRange,
-  DiagnosticWithLocation, CompilerOptions, ResolvedModuleFull, ResolvedModule,
-  getDefaultLibFileName, createLanguageService } from "typescript";
+  NewLineKind, Extension, LanguageService, LanguageServiceHost, Diagnostic,
+  IScriptSnapshot, TextChangeRange, DiagnosticWithLocation, CompilerOptions,
+  ResolvedModuleWithFailedLookupLocations, getDefaultLibFileName,
+  createLanguageService } from "typescript";
 import { Rule } from "eslint";
 import { Node } from "estree";
+
+import { Config, decodeConfig } from "./utils";
 
 const languageServiceMap = new Map<string, LanguageService>();
 
@@ -16,12 +18,16 @@ const TS_SCRIPTS = [
   ".d.ts",
 ];
 
+const DEFINITIONS = [
+  ".d.ts",
+];
+
 const JS_SCRIPTS = [
   ".js",
   ".jsx",
 ];
 
-const SCRIPTS = TS_SCRIPTS.concat(JS_SCRIPTS);
+const SCRIPTS = TS_SCRIPTS.concat(DEFINITIONS, JS_SCRIPTS);
 
 function exists(name: string): boolean {
   try {
@@ -111,14 +117,14 @@ function* parents(directory: string): Generator<string> {
 
 class ESLintServiceHost implements LanguageServiceHost {
   private projectRoot: string;
-  private compilerOptions: CompilerOptions;
+  private config: Config;
   public snapshots: Map<string, ScriptSnapshot>;
   private scripts: null | string[];
   private modulePaths: string[];
 
-  public constructor(projectRoot: string, compilerOptions: CompilerOptions) {
+  public constructor(projectRoot: string, config: Config) {
     this.projectRoot = projectRoot;
-    this.compilerOptions = compilerOptions;
+    this.config = config;
     this.snapshots = new Map();
     this.scripts = null;
 
@@ -139,11 +145,11 @@ class ESLintServiceHost implements LanguageServiceHost {
   }
 
   public getCompilationSettings(): CompilerOptions {
-    return this.compilerOptions;
+    return this.config.compilerOptions;
   }
 
   public getNewLine(): string {
-    if (this.compilerOptions.newLine == NewLineKind.CarriageReturnLineFeed) {
+    if (this.config.compilerOptions.newLine == NewLineKind.CarriageReturnLineFeed) {
       return "\r\n";
     }
     return "\n";
@@ -180,16 +186,18 @@ class ESLintServiceHost implements LanguageServiceHost {
     return path.join(path.dirname(module), name);
   }
 
-  private resolveModule(name: string, containingFile: string, paths: string[]): ResolvedModuleFull {
+  private resolveModule(name: string, containingFile: string, paths: string[]): ResolvedModuleWithFailedLookupLocations | undefined {
     if (name.startsWith(".")) {
       let target = path.resolve(path.dirname(containingFile), name);
       try {
         let stat = fs.statSync(target);
         if (stat.isFile()) {
           return {
-            resolvedFileName: target,
-            isExternalLibraryImport: false,
-            extension: Extension[path.extname(target)],
+            resolvedModule: {
+              resolvedFileName: target,
+              isExternalLibraryImport: false,
+              extension: Extension[path.extname(target)],
+            }
           };
         } else if (stat.isDirectory()) {
           target = path.join(target, "index");
@@ -204,9 +212,11 @@ class ESLintServiceHost implements LanguageServiceHost {
           let stat = fs.statSync(check);
           if (stat.isFile()) {
             return {
-              resolvedFileName: check,
-              isExternalLibraryImport: false,
-              extension: Extension[extension],
+              resolvedModule: {
+                resolvedFileName: check,
+                isExternalLibraryImport: false,
+                extension: Extension[extension],
+              }
             };
           }
         } catch (e) {
@@ -223,9 +233,11 @@ class ESLintServiceHost implements LanguageServiceHost {
         return undefined;
       }
       return {
-        resolvedFileName: module,
-        isExternalLibraryImport: true,
-        extension: Extension[path.extname(module)],
+        resolvedModule: {
+          resolvedFileName: module,
+          isExternalLibraryImport: true,
+          extension: Extension[path.extname(module)],
+        }
       };
     } catch (e) {
       // Just means the file does not exist.
@@ -234,7 +246,8 @@ class ESLintServiceHost implements LanguageServiceHost {
     return undefined;
   }
 
-  public resolveModuleNames(moduleNames: string[], containingFile: string): ResolvedModule[] {
+  public getResolvedModuleWithFailedLookupLocationsFromCache(modulename: string, containingFile: string): ResolvedModuleWithFailedLookupLocations | undefined {
+    console.log(`Asked for module ${modulename}`);
     let lookupPaths: string[] = [];
     let dir = path.dirname(containingFile);
     while (dir != this.projectRoot) {
@@ -244,9 +257,7 @@ class ESLintServiceHost implements LanguageServiceHost {
 
     lookupPaths = lookupPaths.concat(this.modulePaths);
 
-    return moduleNames.map((name: string) => {
-      return this.resolveModule(name, containingFile, lookupPaths);
-    });
+    return this.resolveModule(modulename, containingFile, lookupPaths);
   }
 }
 
@@ -258,15 +269,6 @@ function findAbove(directory: string, filename: string): string | null {
   }
 
   return null;
-}
-
-function translate(current, kinds) {
-  for (let kind of Object.keys(kinds)) {
-    if (kind.toLowerCase() == current.toLowerCase()) {
-      return kinds[kind];
-    }
-  }
-  return undefined;
 }
 
 function getLanguageService(context: Rule.RuleContext, node: Node): LanguageService | null {
@@ -286,9 +288,9 @@ function getLanguageService(context: Rule.RuleContext, node: Node): LanguageServ
     return languageService;
   }
 
-  let compilerOptions;
+  let config;
   try {
-    compilerOptions = JSON.parse(fs.readFileSync(configFile, { encoding: "utf8" })).compilerOptions;
+    config = decodeConfig(fs.readFileSync(configFile, { encoding: "utf8" }));
   } catch (error) {
     context.report({
       message: "Could not parse tsconfig.json: {{ error }}",
@@ -300,27 +302,7 @@ function getLanguageService(context: Rule.RuleContext, node: Node): LanguageServ
     return null;
   }
 
-  if ("module" in compilerOptions) {
-    compilerOptions.module = translate(compilerOptions.module, ModuleKind);
-  }
-
-  if ("jsx" in compilerOptions) {
-    compilerOptions.jsx = translate(compilerOptions.jsx, JsxEmit);
-  }
-
-  if ("moduleResolution" in compilerOptions) {
-    compilerOptions.moduleResolution = translate(compilerOptions.moduleResolution, ModuleResolutionKind);
-  }
-
-  if ("newLine" in compilerOptions) {
-    compilerOptions.newLine = translate(compilerOptions.newLine, NewLineKind);
-  }
-
-  if ("target" in compilerOptions) {
-    compilerOptions.target = translate(compilerOptions.target, ScriptTarget);
-  }
-
-  let host = new ESLintServiceHost(path.dirname(configFile), compilerOptions);
+  let host = new ESLintServiceHost(path.dirname(configFile), config);
   languageService = createLanguageService(host);
   languageServiceMap.set(configFile, languageService);
   return languageService;

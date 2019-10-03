@@ -15,4 +15,4 @@ const rules: Plugin = {
   },
 };
 
-export default rules;
+module.exports = rules;
