@@ -2,8 +2,10 @@
   "name": "eslint-plugin-mossop-typescript",
   "version": "0.5.0",
   "description": "An eslint plugin that reports type checking errors from TypeScript.",
-  "main": "index.js",
+  "main": "lib/index.js",
   "scripts": {
+    "pre-publish": "tsc",
+    "build": "tsc",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
@@ -20,7 +22,7 @@
     "url": "https://github.com/Mossop/eslint-plugin-mossop-typescript/issues"
   },
   "homepage": "https://github.com/Mossop/eslint-plugin-mossop-typescript#readme",
-  "peerDependencies": {
+  "dependencies": {
     "typescript": "^3.6.3"
   }
 }

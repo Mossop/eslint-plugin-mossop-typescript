@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "target": "ES2015",
+    "isolatedModules": true,
+    "esModuleInterop": true,
+    "moduleResolution": "Node",
+    "outDir": "lib",
+
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitAny": false,
+    "noImplicitReturns": true,
+    "noImplicitThis": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "strictPropertyInitialization": true,
+    "strictNullChecks": true
+  },
+  "include": [
+    "src",
+  ]
+}
