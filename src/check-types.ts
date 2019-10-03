@@ -1,10 +1,14 @@
-const path = require("path");
-const fs = require("fs");
-const {
+import path from "path";
+import fs from "fs";
+import {
   ScriptTarget, NewLineKind, ModuleKind, JsxEmit, ModuleResolutionKind, Extension,
-  getDefaultLibFileName, createLanguageService, getDefaultCompilerOptions } = require("typescript");
+  LanguageService, LanguageServiceHost, Diagnostic, IScriptSnapshot, TextChangeRange,
+  DiagnosticWithLocation, CompilerOptions, ResolvedModuleFull, ResolvedModule,
+  getDefaultLibFileName, createLanguageService } from "typescript";
+import { Rule } from "eslint";
+import { Node } from "estree";
 
-const languageServiceMap = new Map();
+const languageServiceMap = new Map<string, LanguageService>();
 
 const TS_SCRIPTS = [
   ".ts",
@@ -19,9 +23,17 @@ const JS_SCRIPTS = [
 
 const SCRIPTS = TS_SCRIPTS.concat(JS_SCRIPTS);
 
-function findAllScripts(directory, scriptNames) {
+function exists(name: string): boolean {
+  try {
+    return fs.statSync(name).isFile();
+  } catch (e) {
+    return false;
+  }
+}
+
+function findAllScripts(directory: string, scriptNames: string[]): void {
   let entries = fs.readdirSync(directory, { withFileTypes: true });
-  for (entry of entries) {
+  for (let entry of entries) {
     if (entry.name.startsWith(".")) {
       continue;
     }
@@ -39,29 +51,33 @@ function findAllScripts(directory, scriptNames) {
   }
 }
 
-class ScriptSnapshot {
-  constructor(host, filename) {
-    this._content = null
+class ScriptSnapshot implements IScriptSnapshot {
+  private script: null | string;
+  private host: ESLintServiceHost;
+  private filename: string;
+
+  public constructor(host: ESLintServiceHost, filename: string) {
+    this.script = null;
     this.host = host;
     this.filename = filename;
   }
 
-  getContent() {
-    if (this._content) {
-      return this._content;
+  private getContent(): string {
+    if (this.script) {
+      return this.script;
     }
 
-    this._content = fs.readFileSync(this.filename, { encoding: "utf8" });
-    return this._content;
+    this.script = fs.readFileSync(this.filename, { encoding: "utf8" });
+    return this.script;
   }
 
   /** Gets a portion of the script snapshot specified by [start, end). */
-  getText(start, end) {
+  public getText(start: number, end: number): string {
     return this.getContent().substr(start, end - start);
   }
 
   /** Gets the length of this script snapshot. */
-  getLength() {
+  public getLength(): number {
     return this.getContent().length;
   }
 
@@ -72,118 +88,114 @@ class ScriptSnapshot {
    * change range cannot be determined.  However, in that case, incremental parsing will
    * not happen and the entire document will be re - parsed.
    */
-  getChangeRange(oldSnapshot) {
+  public getChangeRange(): TextChangeRange | undefined {
     return undefined;
   }
 
   /** Releases all resources held by this script snapshot */
-  dispose() {
+  public dispose(): void {
     this.script = null;
     this.host.snapshots.delete(this.filename);
   }
 }
 
-class LanguageServiceHost {
-  constructor(projectRoot, compilerOptions) {
+function* parents(directory: string): Generator<string> {
+  let parent = path.dirname(directory);
+  while (parent != directory) {
+    yield directory;
+    directory = parent;
+    parent = path.dirname(directory);
+  }
+  yield directory;
+}
+
+class ESLintServiceHost implements LanguageServiceHost {
+  private projectRoot: string;
+  private compilerOptions: CompilerOptions;
+  public snapshots: Map<string, ScriptSnapshot>;
+  private scripts: null | string[];
+  private modulePaths: string[];
+
+  public constructor(projectRoot: string, compilerOptions: CompilerOptions) {
     this.projectRoot = projectRoot;
     this.compilerOptions = compilerOptions;
     this.snapshots = new Map();
-    this._scripts = null;
+    this.scripts = null;
 
-    // Can't get the correct paths for the actual root for some reason so do this dance.
-    let paths = require.resolve.paths(__filename);
-
-    let count = 0;
-    let dir = path.dirname(__filename);
-    while (true) {
-      count++;
-      let parent = path.dirname(dir);
-      if (parent == dir) {
-        break;
-      }
-      dir = parent;
-    }
-
+    // This gives us the lookup path for this plugin. Need to strip off the
+    // parent directories of this file to get the system lookup directories.
+    let paths: string[] = require.resolve.paths(__filename) || [];
     // This gives us the global paths.
-    paths = paths.slice(count);
+    let globalPaths = paths.slice(Array.from(parents(path.dirname(__filename))).length);
 
-    let parents = [];
-    dir = projectRoot;
-    while (true) {
-      parents.push(path.join(dir, "node_modules"));
-      let parent = path.dirname(dir);
-      if (parent == dir) {
-        break;
-      }
-      dir = parent;
+    // Now we add on the parents of the project.
+    let projectPaths: string[] = [];
+    for (let directory of parents(projectRoot)) {
+      projectPaths.push(path.join(directory, "node_modules"));
     }
 
-    while (parents.length) {
-      paths.unshift(parents.pop());
-    }
-
-    this.modulePaths = paths;
+    this.modulePaths = projectPaths.concat(globalPaths);
+    console.log(`Global lookup paths: ${this.modulePaths}`);
   }
 
-  getCompilationSettings() {
+  public getCompilationSettings(): CompilerOptions {
     return this.compilerOptions;
   }
 
-  getNewLine() {
-    if (NewLineKind[this.compilerOptions.newLine] == "CarriageReturnLineFeed") {
+  public getNewLine(): string {
+    if (this.compilerOptions.newLine == NewLineKind.CarriageReturnLineFeed) {
       return "\r\n";
     }
     return "\n";
   }
 
-  getScriptFileNames() {
-    if (this._scripts == null) {
-      this._scripts = [];
+  public getScriptFileNames(): string[] {
+    if (this.scripts == null) {
+      this.scripts = [];
       // ICK
-      findAllScripts(this.projectRoot, this._scripts);
+      findAllScripts(this.projectRoot, this.scripts);
     }
 
-    return this._scripts;
+    return this.scripts;
   }
 
-  getScriptVersion(fileName) {
+  public getScriptVersion(): string {
     return "1";
   }
 
-  getScriptSnapshot(fileName) {
+  public getScriptSnapshot(fileName: string): IScriptSnapshot | undefined {
     if (!this.snapshots.has(fileName)) {
       this.snapshots.set(fileName, new ScriptSnapshot(this, fileName));
     }
     return this.snapshots.get(fileName);
   }
 
-  getCurrentDirectory() {
+  public getCurrentDirectory(): string {
     return process.cwd();
   }
 
-  getDefaultLibFileName(options) {
+  public getDefaultLibFileName(options: CompilerOptions): string {
     let name = getDefaultLibFileName(options);
     let module = require.resolve("typescript");
     return path.join(path.dirname(module), name);
   }
 
-  resolveModule(name, containingFile, paths) {
+  private resolveModule(name: string, containingFile: string, paths: string[]): ResolvedModuleFull {
     if (name.startsWith(".")) {
       let target = path.resolve(path.dirname(containingFile), name);
       try {
         let stat = fs.statSync(target);
         if (stat.isFile()) {
           return {
-            resolvedModule: {
-              resolvedFileName: target,
-              isExternalLibraryImport: false,
-              extension: Extension[path.extname(target)],
-            }
+            resolvedFileName: target,
+            isExternalLibraryImport: false,
+            extension: Extension[path.extname(target)],
           };
         } else if (stat.isDirectory()) {
           target = path.join(target, "index");
         }
       } catch (e) {
+        // Just means the file does not exist.
       }
 
       for (let extension of SCRIPTS) {
@@ -192,14 +204,13 @@ class LanguageServiceHost {
           let stat = fs.statSync(check);
           if (stat.isFile()) {
             return {
-              resolvedModule: {
-                resolvedFileName: check,
-                isExternalLibraryImport: false,
-                extension: Extension[extension],
-              }
+              resolvedFileName: check,
+              isExternalLibraryImport: false,
+              extension: Extension[extension],
             };
           }
         } catch (e) {
+        // Just means the file does not exist.
         }
       }
 
@@ -212,69 +223,41 @@ class LanguageServiceHost {
         return undefined;
       }
       return {
-        resolvedModule: {
-          resolvedFileName: module,
-          isExternalLibraryImport: module.indexOf(external) >= 0,
-          extension: Extension[path.extname(module)],
-        }
+        resolvedFileName: module,
+        isExternalLibraryImport: true,
+        extension: Extension[path.extname(module)],
       };
     } catch (e) {
+      // Just means the file does not exist.
     }
+
     return undefined;
   }
 
-  resolveModuleNames(moduleNames, containingFile, reusedNames, redirectedReference, options) {
-    let paths = [];
+  public resolveModuleNames(moduleNames: string[], containingFile: string): ResolvedModule[] {
+    let lookupPaths: string[] = [];
     let dir = path.dirname(containingFile);
     while (dir != this.projectRoot) {
-      paths.push(path.join(dir, "node_modules"));
+      lookupPaths.push(path.join(dir, "node_modules"));
       dir = path.dirname(dir);
     }
 
-    for (let dir of this.modulePaths) {
-      paths.push(dir);
-    }
+    lookupPaths = lookupPaths.concat(this.modulePaths);
 
-    return moduleNames.map((name) => {
-      let resolved = this.resolveModule(name, containingFile, paths);
-      return resolved ? resolved.resolvedModule : undefined;
-    })
-  }
-
-  getResolvedModuleWithFailedLookupLocationsFromCache(name, containingFile) {
-    let paths = [];
-    let dir = path.dirname(containingFile);
-    while (dir != this.projectRoot) {
-      paths.push(path.join(dir, "node_modules"));
-      dir = path.dirname(dir);
-    }
-
-    for (let dir of this.modulePaths) {
-      paths.push(dir);
-    }
-
-    return this.resolveModule(name, containingFile, paths);
+    return moduleNames.map((name: string) => {
+      return this.resolveModule(name, containingFile, lookupPaths);
+    });
   }
 }
 
-function findAbove(directory, filename) {
-  const exists = (name) => {
-    try {
-      return fs.statSync(name).isFile();
-    } catch (e) {
-      return false;
+function findAbove(directory: string, filename: string): string | null {
+  for (let current of parents(directory)) {
+    if (exists(path.join(current, filename))) {
+      return path.join(current, filename);
     }
   }
 
-  while (!exists(path.join(directory, filename))) {
-    let above = path.dirname(directory);
-    if (above == directory) {
-      return null;
-    }
-    directory = above;
-  }
-
-  return path.join(directory, filename);
+  return null;
 }
 
 function translate(current, kinds) {
@@ -286,7 +269,7 @@ function translate(current, kinds) {
   return undefined;
 }
 
-function getLanguageService(context, node) {
+function getLanguageService(context: Rule.RuleContext, node: Node): LanguageService | null {
   let filename = context.getFilename();
 
   let configFile = findAbove(path.dirname(filename), "tsconfig.json");
@@ -337,63 +320,60 @@ function getLanguageService(context, node) {
     compilerOptions.target = translate(compilerOptions.target, ScriptTarget);
   }
 
-  let host = new LanguageServiceHost(path.dirname(configFile), compilerOptions);
+  let host = new ESLintServiceHost(path.dirname(configFile), compilerOptions);
   languageService = createLanguageService(host);
   languageServiceMap.set(configFile, languageService);
   return languageService;
 }
 
-function reportDiagnostic(context, node, diagnostic) {
-  let report = {
-    node,
-  };
-
-  if (diagnostic.file && diagnostic.start !== undefined) {
-    delete report.node;
-    report.loc = {
-      start: {
-        line: 1,
-        column: 0,
-      },
-      end: {
-        line: 1,
-        column: 0,
-      }
-    };
-
-    let start = diagnostic.file.getLineAndCharacterOfPosition(diagnostic.start);
-    report.loc.start.line = start.line + 1;
-    report.loc.start.column = start.character;
-
-    let end = diagnostic.file.getLineAndCharacterOfPosition(diagnostic.start + diagnostic.length);
-    report.loc.end.line = end.line + 1;
-    report.loc.end.column = end.character;
+function isDiagnosticWithLocation(diagnostic: Diagnostic): diagnostic is DiagnosticWithLocation {
+  if (diagnostic.file && diagnostic.start && diagnostic.length) {
+    return true;
   }
-
-  if (typeof diagnostic.messageText == "object") {
-    report.message = "TS{{ code }}: {{ message }}";
-    report.data = {
-      code: diagnostic.messageText.code,
-      message: diagnostic.messageText.messageText,
-    };
-  } else {
-    report.message = "TS{{ code }}: {{ message }}";
-    report.data = {
-      code: diagnostic.code,
-      message: diagnostic.messageText,
-    };
-  }
-
-  context.report(report);
+  return false;
 }
 
-function checkTypes(context, node) {
+function reportDiagnostic(context: Rule.RuleContext, node: Node, diagnostic: Diagnostic): void {
+  let message: string;
+
+  if (typeof diagnostic.messageText == "object") {
+    message = `TS${diagnostic.messageText.code}: ${diagnostic.messageText.messageText}`;
+  } else {
+    message = `TS${diagnostic.code}: ${diagnostic.messageText}`;
+  }
+
+  if (isDiagnosticWithLocation(diagnostic)) {
+    let start = diagnostic.file.getLineAndCharacterOfPosition(diagnostic.start);
+    let end = diagnostic.file.getLineAndCharacterOfPosition(diagnostic.start + diagnostic.length);
+
+    context.report({
+      message,
+      loc: {
+        start: {
+          line: start.line + 1,
+          column: start.character,
+        },
+        end: {
+          line: end.line + 1,
+          column: end.character,
+        }
+      }
+    });
+  } else {
+    context.report({
+      node,
+      message,
+    });
+  }
+}
+
+function checkTypes(context: Rule.RuleContext, node: Node): void {
   let languageService = getLanguageService(context, node);
   if (!languageService) {
     return;
   }
 
-  let diags = languageService.getSyntacticDiagnostics(context.getFilename());
+  let diags: Diagnostic[] = languageService.getSyntacticDiagnostics(context.getFilename());
   for (let diag of diags) {
     reportDiagnostic(context, node, diag);
   }
@@ -409,14 +389,16 @@ function checkTypes(context, node) {
   }
 }
 
-module.exports = {
+const rules: Rule.RuleModule = {
   meta: {
     type: "problem",
   },
-  create: function(context) {
+  create: function(context: Rule.RuleContext): Rule.RuleListener {
     // declare the state of the rule
     return {
-      Program: (node) => checkTypes(context, node),
+      Program: (node: Node): void => checkTypes(context, node),
     };
   }
 };
+
+export default rules;
