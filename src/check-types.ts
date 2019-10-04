@@ -1,35 +1,34 @@
 import path from "path";
 import fs from "fs";
 import {
-  NewLineKind, Extension, LanguageService, LanguageServiceHost, Diagnostic,
+  NewLineKind, LanguageService, LanguageServiceHost, Diagnostic,
   IScriptSnapshot, TextChangeRange, DiagnosticWithLocation, CompilerOptions,
-  ResolvedModuleWithFailedLookupLocations, getDefaultLibFileName,
-  createLanguageService } from "typescript";
+  ResolvedProjectReference, ResolvedModule, ResolvedModuleFull, getDefaultLibFileName,
+  createLanguageService, Extension } from "typescript";
 import { Rule } from "eslint";
 import { Node } from "estree";
 
-import { Config, decodeConfig } from "./utils";
+import { Config, decodeConfig, loadPackage } from "./utils";
 
 const languageServiceMap = new Map<string, LanguageService>();
 
-const TS_SCRIPTS = [
-  ".ts",
-  ".tsx",
-  ".d.ts",
+const TS_EXTENSIONS = [
+  Extension.Ts,
+  Extension.Tsx,
+  Extension.Dts,
 ];
 
-const DEFINITIONS = [
-  ".d.ts",
+const JS_EXTENSIONS = [
+  Extension.Js,
+  Extension.Jsx,
+  Extension.Json,
 ];
 
-const JS_SCRIPTS = [
-  ".js",
-  ".jsx",
-];
+function isFile(name?: string): boolean {
+  if (!name) {
+    return false;
+  }
 
-const SCRIPTS = TS_SCRIPTS.concat(DEFINITIONS, JS_SCRIPTS);
-
-function exists(name: string): boolean {
   try {
     return fs.statSync(name).isFile();
   } catch (e) {
@@ -37,24 +36,137 @@ function exists(name: string): boolean {
   }
 }
 
-function findAllScripts(directory: string, scriptNames: string[]): void {
-  let entries = fs.readdirSync(directory, { withFileTypes: true });
-  for (let entry of entries) {
-    if (entry.name.startsWith(".")) {
-      continue;
-    }
-
-    if (entry.name == "node_modules") {
-      continue;
-    }
-
-    let full = path.join(directory, entry.name);
-    if (entry.isDirectory()) {
-      findAllScripts(full, scriptNames);
-    } else if (entry.isFile() && SCRIPTS.includes(path.extname(entry.name))) {
-      scriptNames.push(full);
+function findAny(target: string, extensions: Extension[], isGlobal: boolean): ResolvedModuleFull | undefined {
+  for (let extension of extensions) {
+    if (isFile(target + extension)) {
+      return {
+        resolvedFileName: target + extension,
+        isExternalLibraryImport: isGlobal,
+        extension,
+      };
     }
   }
+
+  return undefined;
+}
+
+function getExtensionFromFileName(name: string, guess: Extension): Extension {
+  for (let key of Object.keys(Extension)) {
+    if (name.endsWith(key)) {
+      return Extension[key];
+    }
+  }
+
+  return guess;
+}
+
+// Special lookup for a types package. Only find definitions or a package.json
+// with typings.
+function findTypes(target: string): ResolvedModuleFull | undefined {
+  if (isFile(target + ".d.ts")) {
+    return {
+      resolvedFileName: target + ".d.ts",
+      isExternalLibraryImport: true,
+      extension: Extension.Dts,
+    };
+  }
+
+  let pkg = loadPackage(target);
+  if (pkg && pkg.typings && isFile(pkg.typings)) {
+    return {
+      resolvedFileName: pkg.typings,
+      isExternalLibraryImport: true,
+      extension: getExtensionFromFileName(pkg.typings, Extension.Dts),
+    };
+  }
+
+  if (isFile(path.join(target, "index.d.ts"))) {
+    return {
+      resolvedFileName: path.join(target, "index.d.ts"),
+      isExternalLibraryImport: true,
+      extension: Extension.Dts,
+    };
+  }
+
+  return undefined;
+}
+
+function findModule(directory: string, name: string, typeRoots?: string[]): ResolvedModuleFull | undefined {
+  let target = path.join(directory, name);
+  let isGlobal = !!typeRoots;
+
+  // Look for types first.
+  let found = findAny(target, TS_EXTENSIONS, isGlobal);
+  if (found) {
+    return found;
+  }
+
+  let pkg = loadPackage(target);
+  if (pkg && pkg.typings && isFile(pkg.typings)) {
+    return {
+      resolvedFileName: pkg.typings,
+      isExternalLibraryImport: isGlobal,
+      extension: getExtensionFromFileName(pkg.typings, Extension.Dts),
+    };
+  }
+
+  // Typing packages?
+  if (typeRoots) {
+    for (let dir of typeRoots) {
+      let typesPackage = path.join(dir, name);
+      let found = findTypes(typesPackage);
+      if (found) {
+        return found;
+      }
+    }
+  }
+
+  let index = path.join(target, "index");
+  found = findAny(index, TS_EXTENSIONS, isGlobal);
+  if (found) {
+    return found;
+  }
+
+  // No types. Try looking for js modules then.
+  found = findAny(target, JS_EXTENSIONS, isGlobal);
+  if (found) {
+    return found;
+  }
+
+  if (pkg && pkg.index && isFile(pkg.index)) {
+    return {
+      resolvedFileName: pkg.index,
+      isExternalLibraryImport: isGlobal,
+      extension: getExtensionFromFileName(pkg.index, Extension.Js),
+    };
+  }
+
+  return findAny(index, JS_EXTENSIONS, isGlobal);
+}
+
+function moduleLookup(directory: string, name: string, options: CompilerOptions, globals: string[]): ResolvedModuleFull | undefined {
+  if (name.startsWith(".")) {
+    // Simple relative case.
+    let target = path.resolve(directory, name);
+    return findModule(path.dirname(target), path.basename(target));
+  }
+
+  let checkTypesPackages = !options.types || options.types.includes(name);
+
+  // Now look through the global directories.
+  for (let global of globals) {
+    let typePackages: string[] = [];
+    if (checkTypesPackages) {
+      typePackages = options.typeRoots || [path.join(global, "@types")];
+    }
+
+    let found = findModule(global, name, typePackages);
+    if (found) {
+      return found;
+    }
+  }
+
+  return undefined;
 }
 
 class ScriptSnapshot implements IScriptSnapshot {
@@ -116,17 +228,16 @@ function* parents(directory: string): Generator<string> {
 }
 
 class ESLintServiceHost implements LanguageServiceHost {
-  private projectRoot: string;
   private config: Config;
   public snapshots: Map<string, ScriptSnapshot>;
-  private scripts: null | string[];
+  //private scripts: null | string[];
   private modulePaths: string[];
+  private rootFile: string;
 
-  public constructor(projectRoot: string, config: Config) {
-    this.projectRoot = projectRoot;
+  public constructor(projectRoot: string, config: Config, rootFile: string) {
     this.config = config;
     this.snapshots = new Map();
-    this.scripts = null;
+    this.rootFile = rootFile;
 
     // This gives us the lookup path for this plugin. Need to strip off the
     // parent directories of this file to get the system lookup directories.
@@ -141,7 +252,6 @@ class ESLintServiceHost implements LanguageServiceHost {
     }
 
     this.modulePaths = projectPaths.concat(globalPaths);
-    console.log(`Global lookup paths: ${this.modulePaths}`);
   }
 
   public getCompilationSettings(): CompilerOptions {
@@ -155,14 +265,20 @@ class ESLintServiceHost implements LanguageServiceHost {
     return "\n";
   }
 
-  public getScriptFileNames(): string[] {
-    if (this.scripts == null) {
-      this.scripts = [];
-      // ICK
-      findAllScripts(this.projectRoot, this.scripts);
-    }
+  public log(s: string): void {
+    console.log(s);
+  }
 
-    return this.scripts;
+  public trace(s: string): void {
+    console.trace(s);
+  }
+
+  public error(s: string): void {
+    console.error(s);
+  }
+
+  public getScriptFileNames(): string[] {
+    return [this.rootFile];
   }
 
   public getScriptVersion(): string {
@@ -186,84 +302,17 @@ class ESLintServiceHost implements LanguageServiceHost {
     return path.join(path.dirname(module), name);
   }
 
-  private resolveModule(name: string, containingFile: string, paths: string[]): ResolvedModuleWithFailedLookupLocations | undefined {
-    if (name.startsWith(".")) {
-      let target = path.resolve(path.dirname(containingFile), name);
-      try {
-        let stat = fs.statSync(target);
-        if (stat.isFile()) {
-          return {
-            resolvedModule: {
-              resolvedFileName: target,
-              isExternalLibraryImport: false,
-              extension: Extension[path.extname(target)],
-            }
-          };
-        } else if (stat.isDirectory()) {
-          target = path.join(target, "index");
-        }
-      } catch (e) {
-        // Just means the file does not exist.
-      }
-
-      for (let extension of SCRIPTS) {
-        try {
-          let check = `${target}${extension}`;
-          let stat = fs.statSync(check);
-          if (stat.isFile()) {
-            return {
-              resolvedModule: {
-                resolvedFileName: check,
-                isExternalLibraryImport: false,
-                extension: Extension[extension],
-              }
-            };
-          }
-        } catch (e) {
-        // Just means the file does not exist.
-        }
-      }
-
-      return undefined;
-    }
-
-    try {
-      let module = require.resolve(name, { paths });
-      if (path.extname(module) == "") {
-        return undefined;
-      }
-      return {
-        resolvedModule: {
-          resolvedFileName: module,
-          isExternalLibraryImport: true,
-          extension: Extension[path.extname(module)],
-        }
-      };
-    } catch (e) {
-      // Just means the file does not exist.
-    }
-
-    return undefined;
-  }
-
-  public getResolvedModuleWithFailedLookupLocationsFromCache(modulename: string, containingFile: string): ResolvedModuleWithFailedLookupLocations | undefined {
-    console.log(`Asked for module ${modulename}`);
-    let lookupPaths: string[] = [];
-    let dir = path.dirname(containingFile);
-    while (dir != this.projectRoot) {
-      lookupPaths.push(path.join(dir, "node_modules"));
-      dir = path.dirname(dir);
-    }
-
-    lookupPaths = lookupPaths.concat(this.modulePaths);
-
-    return this.resolveModule(modulename, containingFile, lookupPaths);
+  public resolveModuleNames(moduleNames: string[], containingFile: string, _reusedNames: string[] | undefined, _redirectedReference: ResolvedProjectReference | undefined, options: CompilerOptions): (ResolvedModule | undefined)[] {
+    let directory = path.dirname(containingFile);
+    return moduleNames.map((name: string) => {
+      return moduleLookup(directory, name, options, this.modulePaths);
+    });
   }
 }
 
 function findAbove(directory: string, filename: string): string | null {
   for (let current of parents(directory)) {
-    if (exists(path.join(current, filename))) {
+    if (isFile(path.join(current, filename))) {
       return path.join(current, filename);
     }
   }
@@ -290,7 +339,7 @@ function getLanguageService(context: Rule.RuleContext, node: Node): LanguageServ
 
   let config;
   try {
-    config = decodeConfig(fs.readFileSync(configFile, { encoding: "utf8" }));
+    config = decodeConfig(configFile);
   } catch (error) {
     context.report({
       message: "Could not parse tsconfig.json: {{ error }}",
@@ -302,7 +351,7 @@ function getLanguageService(context: Rule.RuleContext, node: Node): LanguageServ
     return null;
   }
 
-  let host = new ESLintServiceHost(path.dirname(configFile), config);
+  let host = new ESLintServiceHost(path.dirname(configFile), config, filename);
   languageService = createLanguageService(host);
   languageServiceMap.set(configFile, languageService);
   return languageService;
