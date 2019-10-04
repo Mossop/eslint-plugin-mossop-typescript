@@ -11,6 +11,14 @@ import globby from "globby";
 
 import { Config, decodeConfig, loadPackage } from "./utils";
 
+export interface Options {
+  reportCategories: DiagnosticCategory[];
+}
+
+export interface PluginOptions {
+  categories?: string[];
+}
+
 const diagnosticsMap = new Map<string, Diagnostic[] | undefined>();
 const projectMap = new Map<string, ESLintProject | undefined>();
 
@@ -507,7 +515,7 @@ function reportDiagnostic(context: Rule.RuleContext, node: Node, diagnostic: Dia
   }
 }
 
-function checkTypes(context: Rule.RuleContext, node: Node): void {
+function checkTypes(context: Rule.RuleContext, node: Node, options: Options): void {
   if (!diagnosticsMap.has(context.getFilename())) {
     let project = getProject(context, node);
     if (!project) {
@@ -534,24 +542,62 @@ function checkTypes(context: Rule.RuleContext, node: Node): void {
   let diagnostics = diagnosticsMap.get(context.getFilename());
   if (diagnostics) {
     for (let diag of diagnostics) {
-      reportDiagnostic(context, node, diag);
+      if (options.reportCategories.includes(diag.category)) {
+        reportDiagnostic(context, node, diag);
+      }
     }
   }
 }
 
-const rules: Rule.RuleModule = {
-  meta: {
-    type: "problem",
-    messages: {
-      tserror: "{{ text }} ts({{ code }}) {{ category }}"
-    }
-  },
-  create: function(context: Rule.RuleContext): Rule.RuleListener {
-    // declare the state of the rule
-    return {
-      Program: (node: Node): void => checkTypes(context, node),
-    };
-  }
-};
+function optionsFromPlugin(pluginOptions?: PluginOptions): Options {
+  let options: Options = {
+    reportCategories: [
+      DiagnosticCategory.Error,
+      DiagnosticCategory.Warning,
+      DiagnosticCategory.Message,
+      DiagnosticCategory.Suggestion,
+    ]
+  };
 
-export default rules;
+  if (pluginOptions) {
+    if (pluginOptions.categories) {
+      options.reportCategories = [];
+      if (pluginOptions.categories.includes("errors")) {
+        options.reportCategories.push(DiagnosticCategory.Error);
+      }
+      if (pluginOptions.categories.includes("warnings")) {
+        options.reportCategories.push(DiagnosticCategory.Warning);
+      }
+      if (pluginOptions.categories.includes("messages")) {
+        options.reportCategories.push(DiagnosticCategory.Message);
+      }
+      if (pluginOptions.categories.includes("suggestions")) {
+        options.reportCategories.push(DiagnosticCategory.Suggestion);
+      }
+    }
+  }
+
+  return options;
+}
+
+export function buildRule(pluginOptions?: PluginOptions): Rule.RuleModule {
+  return {
+    meta: {
+      type: "problem",
+      messages: {
+        tserror: "{{ text }} ts({{ code }}) {{ category }}"
+      }
+    },
+    create: function(context: Rule.RuleContext): Rule.RuleListener {
+      let options: Options;
+      if (pluginOptions) {
+        options = optionsFromPlugin(pluginOptions);
+      } else {
+        options = optionsFromPlugin(context.options[0]);
+      }
+      return {
+        Program: (node: Node): void => checkTypes(context, node, options),
+      };
+    }
+  };
+}

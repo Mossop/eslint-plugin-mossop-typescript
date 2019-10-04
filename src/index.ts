@@ -1,5 +1,6 @@
 import { Rule } from "eslint";
-import checkTypesRule from "./check-types";
+
+import { buildRule } from "./check-types";
 
 interface PluginRules {
   [s: string]: Rule.RuleModule;
@@ -11,7 +12,11 @@ interface Plugin {
 
 const rules: Plugin = {
   rules: {
-    "check-types": checkTypesRule,
+    "check-types": buildRule(),
+    "type-errors": buildRule({ categories: ["errors"] }),
+    "type-warnings": buildRule({ categories: ["warnings"] }),
+    "type-suggestions": buildRule({ categories: ["suggestions"] }),
+    "type-messages": buildRule({ categories: ["messages"] }),
   },
 };
 
