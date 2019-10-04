@@ -4,13 +4,15 @@ import {
   NewLineKind, LanguageService, LanguageServiceHost, Diagnostic,
   IScriptSnapshot, TextChangeRange, DiagnosticWithLocation, CompilerOptions,
   ResolvedProjectReference, ResolvedModule, ResolvedModuleFull, getDefaultLibFileName,
-  createLanguageService, Extension } from "typescript";
+  createLanguageService, Extension, flattenDiagnosticMessageText, DiagnosticCategory } from "typescript";
 import { Rule } from "eslint";
 import { Node } from "estree";
+import globby from "globby";
 
 import { Config, decodeConfig, loadPackage } from "./utils";
 
-const languageServiceMap = new Map<string, LanguageService>();
+const diagnosticsMap = new Map<string, Diagnostic[] | undefined>();
+const projectMap = new Map<string, ESLintProject | undefined>();
 
 const TS_EXTENSIONS = [
   Extension.Ts,
@@ -23,6 +25,68 @@ const JS_EXTENSIONS = [
   Extension.Jsx,
   Extension.Json,
 ];
+
+function findIncludedFiles(config: Config, root: string): string[] {
+  let allowedExtensions: Extension[] = [
+    Extension.Ts,
+    Extension.Tsx,
+    Extension.Dts,
+  ];
+
+  if (config.compilerOptions.allowJs) {
+    allowedExtensions.push(Extension.Js);
+    allowedExtensions.push(Extension.Jsx);
+  }
+
+  let extensionGlobs = allowedExtensions.map((ext: Extension) => "*" + ext);
+
+  let files: string[];
+  if (config.include) {
+    let include: string[] = [];
+    for (let glob of config.include) {
+      if (glob.endsWith("*") || glob.endsWith(".*")) {
+        if (glob.endsWith(".*")) {
+          glob = glob.substr(0, glob.length - 2);
+        } else {
+          glob = glob.substr(0, glob.length - 1);
+        }
+
+        for (let extension of extensionGlobs) {
+          include.push(glob + extension);
+        }
+      } else {
+        include.push(glob);
+      }
+    }
+
+    files = globby.sync(include, {
+      ignore: config.exclude,
+      cwd: root,
+      onlyFiles: true,
+      unique: true,
+      expandDirectories: extensionGlobs,
+    });
+  } else if (!config.files) {
+    files = globby.sync(extensionGlobs.map((glob: string) => "**/" + glob), {
+      ignore: config.exclude,
+      cwd: root,
+      onlyFiles: true,
+      unique: true,
+    });
+  } else {
+    files = [];
+  }
+
+  if (config.files) {
+    for (let file of config.files) {
+      if (!files.includes(file)) {
+        files.push(file);
+      }
+    }
+  }
+
+  return files;
+}
 
 function isFile(name?: string): boolean {
   if (!name) {
@@ -50,14 +114,18 @@ function findAny(target: string, extensions: Extension[], isGlobal: boolean): Re
   return undefined;
 }
 
-function getExtensionFromFileName(name: string, guess: Extension): Extension {
+function getExtensionFromFileName(name: string): Extension | undefined {
   for (let key of Object.keys(Extension)) {
+    if (!name.startsWith(".")) {
+      continue;
+    }
+
     if (name.endsWith(key)) {
-      return Extension[key];
+      return Extension[Extension[key]];
     }
   }
 
-  return guess;
+  return undefined;
 }
 
 // Special lookup for a types package. Only find definitions or a package.json
@@ -76,7 +144,7 @@ function findTypes(target: string): ResolvedModuleFull | undefined {
     return {
       resolvedFileName: pkg.typings,
       isExternalLibraryImport: true,
-      extension: getExtensionFromFileName(pkg.typings, Extension.Dts),
+      extension: getExtensionFromFileName(pkg.typings) || Extension.Dts,
     };
   }
 
@@ -106,7 +174,7 @@ function findModule(directory: string, name: string, typeRoots?: string[]): Reso
     return {
       resolvedFileName: pkg.typings,
       isExternalLibraryImport: isGlobal,
-      extension: getExtensionFromFileName(pkg.typings, Extension.Dts),
+      extension: getExtensionFromFileName(pkg.typings) || Extension.Dts,
     };
   }
 
@@ -137,36 +205,11 @@ function findModule(directory: string, name: string, typeRoots?: string[]): Reso
     return {
       resolvedFileName: pkg.index,
       isExternalLibraryImport: isGlobal,
-      extension: getExtensionFromFileName(pkg.index, Extension.Js),
+      extension: getExtensionFromFileName(pkg.index) || Extension.Js,
     };
   }
 
   return findAny(index, JS_EXTENSIONS, isGlobal);
-}
-
-function moduleLookup(directory: string, name: string, options: CompilerOptions, globals: string[]): ResolvedModuleFull | undefined {
-  if (name.startsWith(".")) {
-    // Simple relative case.
-    let target = path.resolve(directory, name);
-    return findModule(path.dirname(target), path.basename(target));
-  }
-
-  let checkTypesPackages = !options.types || options.types.includes(name);
-
-  // Now look through the global directories.
-  for (let global of globals) {
-    let typePackages: string[] = [];
-    if (checkTypesPackages) {
-      typePackages = options.typeRoots || [path.join(global, "@types")];
-    }
-
-    let found = findModule(global, name, typePackages);
-    if (found) {
-      return found;
-    }
-  }
-
-  return undefined;
 }
 
 class ScriptSnapshot implements IScriptSnapshot {
@@ -227,17 +270,23 @@ function* parents(directory: string): Generator<string> {
   yield directory;
 }
 
+interface ESLintProject {
+  host: ESLintServiceHost;
+  language: LanguageService;
+}
+
 class ESLintServiceHost implements LanguageServiceHost {
   private config: Config;
   public snapshots: Map<string, ScriptSnapshot>;
-  //private scripts: null | string[];
   private modulePaths: string[];
-  private rootFile: string;
+  private moduleCache: Map<string, ResolvedModuleFull | undefined>;
+  private files: string[];
 
-  public constructor(projectRoot: string, config: Config, rootFile: string) {
+  public constructor(projectRoot: string, config: Config) {
     this.config = config;
     this.snapshots = new Map();
-    this.rootFile = rootFile;
+    this.moduleCache = new Map();
+    this.files = findIncludedFiles(config, projectRoot);
 
     // This gives us the lookup path for this plugin. Need to strip off the
     // parent directories of this file to get the system lookup directories.
@@ -278,7 +327,7 @@ class ESLintServiceHost implements LanguageServiceHost {
   }
 
   public getScriptFileNames(): string[] {
-    return [this.rootFile];
+    return this.files;
   }
 
   public getScriptVersion(): string {
@@ -302,10 +351,48 @@ class ESLintServiceHost implements LanguageServiceHost {
     return path.join(path.dirname(module), name);
   }
 
+  private moduleLookup(directory: string, name: string, options: CompilerOptions, globals: string[]): ResolvedModuleFull | undefined {
+    if (name.startsWith(".")) {
+      // Simple relative case.
+      let target = path.resolve(directory, name);
+
+      if (this.moduleCache.has(target)) {
+        return this.moduleCache.get(target);
+      }
+
+      let result = findModule(path.dirname(target), path.basename(target));
+      this.moduleCache.set(target, result);
+      return result;
+    }
+
+    if (this.moduleCache.has(name)) {
+      return this.moduleCache.get(name);
+    }
+
+    let checkTypesPackages = !options.types || options.types.includes(name);
+
+    // Now look through the global directories.
+    for (let global of globals) {
+      let typePackages: string[] = [];
+      if (checkTypesPackages) {
+        typePackages = options.typeRoots || [path.join(global, "@types")];
+      }
+
+      let found = findModule(global, name, typePackages);
+      if (found) {
+        this.moduleCache.set(name, found);
+        return found;
+      }
+    }
+
+    this.moduleCache.set(name, undefined);
+    return undefined;
+  }
+
   public resolveModuleNames(moduleNames: string[], containingFile: string, _reusedNames: string[] | undefined, _redirectedReference: ResolvedProjectReference | undefined, options: CompilerOptions): (ResolvedModule | undefined)[] {
     let directory = path.dirname(containingFile);
     return moduleNames.map((name: string) => {
-      return moduleLookup(directory, name, options, this.modulePaths);
+      return this.moduleLookup(directory, name, options, this.modulePaths);
     });
   }
 }
@@ -320,24 +407,20 @@ function findAbove(directory: string, filename: string): string | null {
   return null;
 }
 
-function getLanguageService(context: Rule.RuleContext, node: Node): LanguageService | null {
+function getProject(context: Rule.RuleContext, node: Node): ESLintProject | undefined {
   let filename = context.getFilename();
 
   let configFile = findAbove(path.dirname(filename), "tsconfig.json");
   if (!configFile) {
-    context.report({
-      message: "Could not find tsconfig.json.",
-      node,
-    });
-    return null;
+    // Not in a typescript project.
+    return undefined;
   }
 
-  let languageService = languageServiceMap.get(configFile);
-  if (languageService) {
-    return languageService;
+  if (projectMap.has(configFile)) {
+    return projectMap.get(configFile);
   }
 
-  let config;
+  let config: Config;
   try {
     config = decodeConfig(configFile);
   } catch (error) {
@@ -348,13 +431,19 @@ function getLanguageService(context: Rule.RuleContext, node: Node): LanguageServ
         error,
       }
     });
-    return null;
+    return undefined;
   }
 
-  let host = new ESLintServiceHost(path.dirname(configFile), config, filename);
-  languageService = createLanguageService(host);
-  languageServiceMap.set(configFile, languageService);
-  return languageService;
+  let host = new ESLintServiceHost(path.dirname(configFile), config);
+  let language = createLanguageService(host);
+
+  let project: ESLintProject = {
+    host,
+    language,
+  };
+
+  projectMap.set(configFile, project);
+  return project;
 }
 
 function isDiagnosticWithLocation(diagnostic: Diagnostic): diagnostic is DiagnosticWithLocation {
@@ -365,20 +454,38 @@ function isDiagnosticWithLocation(diagnostic: Diagnostic): diagnostic is Diagnos
 }
 
 function reportDiagnostic(context: Rule.RuleContext, node: Node, diagnostic: Diagnostic): void {
-  let message: string;
-
-  if (typeof diagnostic.messageText == "object") {
-    message = `TS${diagnostic.messageText.code}: ${diagnostic.messageText.messageText}`;
-  } else {
-    message = `TS${diagnostic.code}: ${diagnostic.messageText}`;
+  let category = "";
+  switch (diagnostic.category) {
+    case DiagnosticCategory.Warning: {
+      category = "warning";
+      break;
+    }
+    case DiagnosticCategory.Error: {
+      category = "error";
+      break;
+    }
+    case DiagnosticCategory.Suggestion: {
+      category = "suggestion";
+      break;
+    }
+    case DiagnosticCategory.Message: {
+      category = "message";
+      break;
+    }
   }
+
+  let data = {
+    category,
+    code: String(diagnostic.code),
+    text: flattenDiagnosticMessageText(diagnostic.messageText, "\n", 2),
+  };
 
   if (isDiagnosticWithLocation(diagnostic)) {
     let start = diagnostic.file.getLineAndCharacterOfPosition(diagnostic.start);
     let end = diagnostic.file.getLineAndCharacterOfPosition(diagnostic.start + diagnostic.length);
 
     context.report({
-      message,
+      messageId: "tserror",
       loc: {
         start: {
           line: start.line + 1,
@@ -388,41 +495,56 @@ function reportDiagnostic(context: Rule.RuleContext, node: Node, diagnostic: Dia
           line: end.line + 1,
           column: end.character,
         }
-      }
+      },
+      data,
     });
   } else {
     context.report({
       node,
-      message,
+      messageId: "tserror",
+      data,
     });
   }
 }
 
 function checkTypes(context: Rule.RuleContext, node: Node): void {
-  let languageService = getLanguageService(context, node);
-  if (!languageService) {
-    return;
+  if (!diagnosticsMap.has(context.getFilename())) {
+    let project = getProject(context, node);
+    if (!project) {
+      // No TypeScript project found.
+      diagnosticsMap.set(context.getFilename(), undefined);
+      return;
+    }
+
+    if (!project.host.getScriptFileNames().includes(context.getFilename())) {
+      // Not part of the TypeScript project.
+      diagnosticsMap.set(context.getFilename(), undefined);
+      return;
+    }
+
+    let diags = project.language.getSemanticDiagnostics(context.getFilename())
+      .concat(
+        project.language.getSyntacticDiagnostics(context.getFilename()),
+        project.language.getSuggestionDiagnostics(context.getFilename())
+      );
+
+    diagnosticsMap.set(context.getFilename(), diags);
   }
 
-  let diags: Diagnostic[] = languageService.getSyntacticDiagnostics(context.getFilename());
-  for (let diag of diags) {
-    reportDiagnostic(context, node, diag);
-  }
-
-  diags = languageService.getSemanticDiagnostics(context.getFilename());
-  for (let diag of diags) {
-    reportDiagnostic(context, node, diag);
-  }
-
-  diags = languageService.getSuggestionDiagnostics(context.getFilename());
-  for (let diag of diags) {
-    reportDiagnostic(context, node, diag);
+  let diagnostics = diagnosticsMap.get(context.getFilename());
+  if (diagnostics) {
+    for (let diag of diagnostics) {
+      reportDiagnostic(context, node, diag);
+    }
   }
 }
 
 const rules: Rule.RuleModule = {
   meta: {
     type: "problem",
+    messages: {
+      tserror: "{{ text }} ts({{ code }}) {{ category }}"
+    }
   },
   create: function(context: Rule.RuleContext): Rule.RuleListener {
     // declare the state of the rule

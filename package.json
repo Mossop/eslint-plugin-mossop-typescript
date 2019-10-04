@@ -23,6 +23,7 @@
   },
   "homepage": "https://github.com/Mossop/eslint-plugin-mossop-typescript#readme",
   "dependencies": {
+    "globby": "^10.0.1",
     "ts.data.json": "^0.2.1",
     "typescript": "^3.6.3"
   },

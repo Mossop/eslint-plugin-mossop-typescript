@@ -234,7 +234,22 @@ function ConfigDecoder(root: string): JsonDecoder.Decoder<Config> {
 }
 
 export function decodeConfig(configFile: string): Config {
-  return decode(ConfigDecoder(path.dirname(configFile)), JSON.parse(fs.readFileSync(configFile, { encoding: "utf8" })));
+  let root = path.dirname(configFile);
+  let config = decode(ConfigDecoder(root), JSON.parse(fs.readFileSync(configFile, { encoding: "utf8" })));
+
+  if (!config.exclude) {
+    config.exclude = [
+      path.join(root, "node_modules"),
+      path.join(root, "bower_components"),
+      path.join(root, "jspm_packages"),
+    ];
+
+    if (config.compilerOptions.outDir) {
+      config.exclude.push(config.compilerOptions.outDir);
+    }
+  }
+
+  return config;
 }
 
 interface PackageInfo {
