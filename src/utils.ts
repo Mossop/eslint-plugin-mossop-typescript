@@ -254,6 +254,7 @@ export function decodeConfig(configFile: string): Config {
 
 interface PackageInfo {
   index?: string;
+  types?: string;
   typings?: string;
 }
 
@@ -261,7 +262,8 @@ function PackageInfoDecoder(root: string): JsonDecoder.Decoder<PackageInfo> {
   return JsonDecoder.object<PackageInfo>(
     {
       index: OptionalDecoder(PathDecoder(root, "index"), "index?"),
-      typings: OptionalDecoder(PathDecoder(root, "typings"), "typings?"),
+      types: OptionalDecoder(PathDecoder(root, "types"), "types?"),
+      typings: OptionalDecoder(PathDecoder(root, "types"), "typings?"),
     },
     "PackageInfo"
   );

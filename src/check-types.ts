@@ -148,6 +148,14 @@ function findTypes(target: string): ResolvedModuleFull | undefined {
   }
 
   let pkg = loadPackage(target);
+  if (pkg && pkg.types && isFile(pkg.types)) {
+    return {
+      resolvedFileName: pkg.types,
+      isExternalLibraryImport: true,
+      extension: getExtensionFromFileName(pkg.types) || Extension.Dts,
+    };
+  }
+
   if (pkg && pkg.typings && isFile(pkg.typings)) {
     return {
       resolvedFileName: pkg.typings,
@@ -178,6 +186,14 @@ function findModule(directory: string, name: string, typeRoots?: string[]): Reso
   }
 
   let pkg = loadPackage(target);
+  if (pkg && pkg.types && isFile(pkg.types)) {
+    return {
+      resolvedFileName: pkg.types,
+      isExternalLibraryImport: isGlobal,
+      extension: getExtensionFromFileName(pkg.types) || Extension.Dts,
+    };
+  }
+
   if (pkg && pkg.typings && isFile(pkg.typings)) {
     return {
       resolvedFileName: pkg.typings,
